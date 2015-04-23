@@ -45,7 +45,7 @@ Concurrency:
 
 Data structures:
  - TBQueues between:
-   - scheduler -> poller 
+   - scheduler -> poller
    - listener -> store
  - request map: shared by poller & listener.
      poller adds requests, listener removes.
@@ -137,11 +137,14 @@ import qualified Control.Concurrent as Concurrent
 import qualified Control.Concurrent.STM as STM
 import qualified Control.Concurrent.STM.TVar as TVar
 import qualified Control.Concurrent.STM.TBQueue as TBQueue
+import qualified Control.Monad.Trans.Reader as Reader
+import qualified Control.Monad.IO.Class as MonadIO
 import qualified Data.Bits as Bits
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LazyBS
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.List as List
+import qualified Data.Maybe as Maybe
 import qualified Data.Monoid as Monoid
 import qualified Data.Set as Set
 import qualified Data.Time.Clock.POSIX as POSIX
@@ -149,7 +152,8 @@ import qualified Data.Word as Word
 
 import qualified Network.Socket as Socket
 import qualified Network.Socket.ByteString as SocketBS
-import qualified System.IO as IO
+-- import qualified System.IO as IO
+import qualified System.Log as Log
 
 import qualified Network.Protocol.SNMP.UDP as SnmpUDP
 
@@ -203,22 +207,56 @@ mkRequestMap = do
     return (RequestMap (t1, t2))
 
 
+-- These things are all commonly used by this module's functions,
+-- and they don't change, so jam them in a State monad.
+--   request map, requets queue, result queue, scoket
+newtype PollerEnv = PollerEnv
+    ( RequestMap
+    , TBQueue.TBQueue PollRequest
+    , TBQueue.TBQueue PollResult
+    , Socket.Socket
+    , Log.Logger
+    )
+
+
+type PollerM = Reader.ReaderT PollerEnv IO
+
+
 -- Use the first dataseries id as the request id
 -- (arbitrary)
 getSnmpRequestId :: PollRequest -> Int
 getSnmpRequestId = (\(a,_,_) -> a) . head . requestMeasurements
 
 
-addRequestToMap :: RequestMap -> PollRequest -> IO ()
-addRequestToMap maps request = do
-    IO.putStrLn ("addRequestToMap: " ++ show (requestId request))
-    STM.atomically $ do
-        let RequestMap (map1, map2) = maps
+askRequestMap :: PollerM RequestMap
+askRequestMap = do
+    PollerEnv (requestMap, _, _, _, _) <- Reader.ask
+    return requestMap
+
+
+askRequestQueue :: PollerM (TBQueue.TBQueue PollRequest)
+askRequestQueue = do
+    PollerEnv (_, requestQueue, _, _, _) <- Reader.ask
+    return requestQueue
+
+
+askSocket :: PollerM Socket.Socket
+askSocket = do
+    PollerEnv (_, _, _, socket, _) <- Reader.ask
+    return socket
+
+
+addRequestToMap :: PollRequest -> PollerM ()
+addRequestToMap request = do
+    requestMap <- askRequestMap
+    logDebug ("addRequestToMap: " ++ show (requestId request))
+    MonadIO.liftIO $ STM.atomically $ do
+        let RequestMap (map1, map2) = requestMap
         let key1 = getSnmpRequestId request
         let key2 = requestNextTimeout request
         TVar.modifyTVar' map1 (IntMap.insert key1 request)
         TVar.modifyTVar' map2 (IntMap.alter f key2)
-    printMaps maps
+    printMaps
     where
         -- f = maybe (Just [request]) (Just . (request :))
         f Nothing = Just [request]
@@ -226,22 +264,24 @@ addRequestToMap maps request = do
 
 
 -- for debugging
-printMaps :: RequestMap -> IO ()
-printMaps maps = do
-    let RequestMap (tvar1, tvar2) = maps
-    map1 <- STM.atomically (TVar.readTVar tvar1)
-    map2 <- STM.atomically (TVar.readTVar tvar2)
+printMaps :: PollerM ()
+printMaps = do
+    requestMap <- askRequestMap
+    let RequestMap (tvar1, tvar2) = requestMap
+    map1 <- MonadIO.liftIO $ TVar.readTVarIO tvar1
+    map2 <- MonadIO.liftIO $ TVar.readTVarIO tvar2
     let m1 = map (\(k,r) -> show k ++ " -> " ++ requestId r) (IntMap.assocs map1)
     let m2 = map (\(k,r) -> show k ++ " -> " ++ (List.intercalate "," (map requestId r))) (IntMap.assocs map2)
-    IO.putStrLn ("map1: " ++ List.intercalate ", " m1)
-    IO.putStrLn ("map2: " ++ List.intercalate ", " m2)
+    logDebug ("map1: " ++ List.intercalate ", " m1)
+    logDebug ("map2: " ++ List.intercalate ", " m2)
 
 
-deleteFromMap :: RequestMap -> PollRequest -> IO ()
-deleteFromMap maps req = do
-    -- IO.putStrLn ("deleteFromMap: " ++ show (requestId req))
-    let RequestMap (tvar1, tvar2) = maps
-    STM.atomically (do
+deleteFromMap :: PollRequest -> PollerM ()
+deleteFromMap req = do
+    requestMap <- askRequestMap
+    -- logDebug ("deleteFromMap: " ++ show (requestId req))
+    let RequestMap (tvar1, tvar2) = requestMap
+    MonadIO.liftIO $ STM.atomically (do
         -- map1 indexed by request-id
         map1 <- TVar.readTVar tvar1
         TVar.writeTVar tvar1 (IntMap.delete (getSnmpRequestId req) map1)
@@ -249,25 +289,25 @@ deleteFromMap maps req = do
         map2 <- TVar.readTVar tvar2
         let key2 = requestNextTimeout req
         let mb = IntMap.lookup key2 map2
-        case mb of
-            -- if we can't find it, do nothing
-            Nothing -> return ()
-            Just l -> do
-                -- remove any requests with matching request-id
-                let newl = filter (\p -> requestId p /= requestId req) l
-                let newmap = if newl == []
-                    then IntMap.delete key2 map2
-                    else IntMap.insert key2 newl map2
-                TVar.writeTVar tvar2 newmap
+        -- if we can't find it, do nothing
+        maybe (return ()) (\l -> do
+            -- remove any requests with matching request-id
+            let newl = filter (\p -> requestId p /= requestId req) l
+            let newmap = if newl == []
+                then IntMap.delete key2 map2
+                else IntMap.insert key2 newl map2
+            TVar.writeTVar tvar2 newmap
+            ) mb
         )
     -- printMaps maps
 
 
-getRequestById :: RequestMap -> Int -> IO (Maybe PollRequest)
-getRequestById maps reqId = do
-    let RequestMap (map1, _) = maps
-    m <- STM.atomically (TVar.readTVar map1)
-    return (IntMap.lookup reqId m)
+getRequestById :: Int -> PollerM (Maybe PollRequest)
+getRequestById reqId = do
+    requestMap <- askRequestMap
+    let RequestMap (tvmap1, _) = requestMap
+    map1 <- MonadIO.liftIO $ TVar.readTVarIO tvmap1
+    return (IntMap.lookup reqId map1)
 
 
 -- The String ipaddr is the IP address as a String.
@@ -340,39 +380,49 @@ getPOSIXSecs = do
 
 
 -- decrement retry counter and push onto poller queue
-resendRequest :: TBQueue.TBQueue PollRequest -> PollRequest -> IO ()
-resendRequest requestQueue request = do
-    -- IO.putStrLn ("resendRequest: " ++ requestId request)
+resendRequest :: PollRequest -> PollerM ()
+resendRequest request = do
+    requestQueue <- askRequestQueue
+    -- logDebug ("resendRequest: " ++ requestId request)
     let newRetries = requestRetries request - 1
     let newReq = request {requestRetries = newRetries }
-    STM.atomically (TBQueue.writeTBQueue requestQueue newReq)
+    MonadIO.liftIO $ STM.atomically (TBQueue.writeTBQueue requestQueue newReq)
+
+
+sendMeasure oidvals (dsId, calc, oids) = do
+    return ()
 
 
 -- Get the oids and values, apply any post-processing,
 -- construct the PollResults, and send onwards.
-sendResultToStore :: TBQueue.TBQueue PollResult -> PollRequest -> SnmpUDP.SnmpResponse -> IO ()
-sendResultToStore resultQueue request response = do
+sendResultToStore :: PollRequest -> SnmpUDP.SnmpResponse -> PollerM ()
+sendResultToStore request response = do
+    -- PollerEnv (requestMap, requestQueue, resultQueue, socket) <- Reader.ask
     -- FIXME implement
-    IO.putStrLn ("send result to store: " ++ show (requestId request))
+    logDebug ("send result to store: " ++ show (requestId request))
+    let oidvals = getSnmpRespOidVals response
+    mapM_ (sendMeasure oidvals) (requestMeasurements request)
     return ()
 
 
-sendErrorToStore :: TBQueue.TBQueue PollResult -> PollRequest -> SnmpUDP.SnmpResponse -> IO ()
-sendErrorToStore resultQueue request response = do
+sendErrorToStore :: PollRequest -> SnmpUDP.SnmpResponse -> PollerM ()
+sendErrorToStore request response = do
+    -- PollerEnv (requestMap, requestQueue, resultQueue, socket) <- Reader.ask
     -- FIXME implement
-    IO.putStrLn ("send error to store: " ++ show (requestId request))
+    logDebug ("send error to store: " ++ show (requestId request))
     return ()
 
 
-sendTimeoutToStore :: TBQueue.TBQueue PollResult -> PollRequest -> IO ()
-sendTimeoutToStore resultQueue request = do
+sendTimeoutToStore :: PollRequest -> PollerM ()
+sendTimeoutToStore request = do
+    -- PollerEnv (requestMap, requestQueue, resultQueue, socket) <- Reader.ask
     -- FIXME implement
-    IO.putStrLn ("request timeout: " ++ requestId request)
+    logDebug ("request timeout: " ++ requestId request)
     return ()
 
 
 requestOids :: PollRequest -> [String]
-requestOids request = 
+requestOids request =
     List.concat [oids | (_, _, oids) <- requestMeasurements request]
 
 
@@ -395,9 +445,12 @@ getSnmpRespOidVals (SnmpUDP.SnmpSequence l) =
     varbind _ = []
     oid2Str :: [Word.Word64] -> String
     oid2Str oid = List.concat (map (("." ++) . show) oid)
+getSnmpRespOidVals _ = []
 
 
+getSnmpRespOids :: SnmpUDP.SnmpResponse -> [String]
 getSnmpRespOids response = map fst (getSnmpRespOidVals response)
+
 
 -- Check that every oid in the request
 -- has a matching oid in the response.
@@ -406,26 +459,38 @@ oidsMatch request response =
     Set.fromList (getSnmpRespOids response) == Set.fromList (requestOids request)
 
 
-poller :: Socket.Socket -> TBQueue.TBQueue PollRequest -> RequestMap -> IO ()
-poller socket requestQueue requestMap = do
+logError :: String -> PollerM ()
+logError msg = do
+    PollerEnv (_, _, _, _, logger) <- Reader.ask
+    MonadIO.liftIO (Log.error logger msg)
+logDebug :: String -> PollerM ()
+logDebug msg = do
+    PollerEnv (_, _, _, _, logger) <- Reader.ask
+    MonadIO.liftIO (Log.debug logger msg)
+
+
+poller :: PollerM ()
+poller = do
+    socket <- askSocket
+    requestQueue <- askRequestQueue
     -- blocks (STM retry) if nothing on queue
-    request <- STM.atomically (TBQueue.readTBQueue requestQueue)
-    IO.putStrLn("poller: found request on queue: " ++ requestId request)
+    request <- MonadIO.liftIO $ STM.atomically (TBQueue.readTBQueue requestQueue)
+    logDebug ("poller: found request on queue: " ++ requestId request)
     let reqId = getSnmpRequestId request
     let oids = requestOids request
     let snmpReq = SnmpUDP.makeGetRequest (fromIntegral reqId) (requestAuthToken request) oids
     -- parse and print the outgoing request (for debugging)
-    -- either IO.putStrLn (IO.putStrLn . show)
+    -- either logDebug (logDebug . show)
     --     (SnmpUDP.parseSnmpResponse (LazyBS.toStrict snmpReq))
     -- Add request to map before sending packet,
     -- just in case response comes back very quickly
     -- (avoid race condition).
-    now <- getPOSIXSecs
+    now <- MonadIO.liftIO getPOSIXSecs
     let nextTimeout = now + fromIntegral (requestTimeout request)
-    addRequestToMap requestMap (request { requestNextTimeout = nextTimeout })
-    sent <- sendUDPPacket socket (requestAddress request) 161 (LazyBS.toStrict snmpReq)
-    IO.putStrLn ("poller: sent bytes: " ++ show sent)
-    poller socket requestQueue requestMap
+    addRequestToMap (request { requestNextTimeout = nextTimeout })
+    sent <- MonadIO.liftIO (sendUDPPacket socket (requestAddress request) 161 (LazyBS.toStrict snmpReq))
+    logDebug ("poller: sent bytes: " ++ show sent)
+    poller
 
 
 {-
@@ -449,53 +514,42 @@ snmp response error codes:
 17 - not writable
 18 - inconsistent name - name in var bind names something that does not exist
 -}
-processResponse :: BS.ByteString
-    -> TBQueue.TBQueue PollRequest
-    -> TBQueue.TBQueue PollResult
-    -> RequestMap
-    -> IO ()
-processResponse msg requestQueue resultQueue requestMap = do 
-    either IO.putStrLn processParsedResponse (SnmpUDP.parseSnmpResponse msg)
+processResponse :: BS.ByteString -> String -> PollerM ()
+processResponse msg ipaddr = do
+    either logError processParsedResponse (SnmpUDP.parseSnmpResponse msg)
     where
     processParsedResponse response = do
-        IO.putStrLn (show response)
+        -- PollerEnv (requestMap, requestQueue, resultQueue, socket, logger) <- Reader.ask
+        logDebug (show response)
         let reqId = getSnmpRespReqId response
-        mbReq <- getRequestById requestMap reqId
-        case mbReq of
-            -- cannot match? discard
-            Nothing -> do
-                IO.putStrLn ("processResponse: no request for id " ++ show reqId)
-            Just request -> do
-                let (errStatus, errIndex) = getSnmpRespError response
-                -- FIXME check response error codes
-                IO.putStrLn ("processResponse: found request for id " ++ show reqId)
-                deleteFromMap requestMap request
-                if errStatus /= 0
-                then sendErrorToStore resultQueue request response
-                else if oidsMatch request response
-                    then sendResultToStore resultQueue request response
-                    else resendRequest requestQueue request
-                        -- IO.putStrLn ("processResponse: oids do not match; resend")
-                        -- IO.putStrLn ("request oids: " ++ show (requestOids request))
-                        -- IO.putStrLn ("response oids: " ++ show (getSnmpRespOids response))
+        mbReq <- getRequestById reqId
+        if mbReq == Nothing
+        then do
+            logError ("processResponse: no request for id " ++ show reqId)
+        else do
+            -- FIXME check ip addresses match
+            let request = Maybe.fromJust mbReq
+            let (errStatus, errIndex) = getSnmpRespError response
+            -- FIXME check response error codes
+            logDebug ("processResponse: found request for id " ++ show reqId)
+            deleteFromMap request
+            if errStatus /= 0
+            then sendErrorToStore request response
+            else if oidsMatch request response
+                then sendResultToStore request response
+                else resendRequest request
 
 
-listener :: Socket.Socket
-    -> TBQueue.TBQueue PollRequest
-    -> TBQueue.TBQueue PollResult
-    -> RequestMap
-    -> IO ()
-listener socket requestQueue resultQueue requestMap = do
-    (msg, fromSock) <- SocketBS.recvFrom socket 8192
+listener :: PollerM ()
+listener = do
+    socket <- askSocket
+    (msg, fromSock) <- MonadIO.liftIO (SocketBS.recvFrom socket 8192)
     let address = getAddress fromSock
-    -- IO.putStrLn ("listener: received from" ++ show fromSock)
-    -- IO.putStrLn (SnmpUDP.prettyHex msg)
-    -- IO.putStrLn "------------"
-    case address of
-        -- non-ipv4 address - drop it
-        Nothing -> return ()
-        Just _ -> processResponse msg requestQueue resultQueue requestMap
-    listener socket requestQueue resultQueue requestMap
+    -- logDebug ("listener: received from" ++ show fromSock)
+    -- logDebug (SnmpUDP.prettyHex msg)
+    -- logDebug "------------"
+    maybe (return ()) (processResponse msg) address
+    listener
 
 
 -- harvester of sorrow (language of the mad)
@@ -504,11 +558,13 @@ listener socket requestQueue resultQueue requestMap = do
 -- it and send them back to the poller.
 -- If they have exhausted their retries then send
 -- a PollResult forward with timeout failure set.
-timeoutHarvester requestQueue resultQueue requestMap = do
-    now <- getPOSIXSecs
-    -- IO.putStrLn ("scan for timeouts at " ++ show now)
+timeoutHarvester :: PollerM ()
+timeoutHarvester = do
+    requestMap <- askRequestMap
+    now <- MonadIO.liftIO getPOSIXSecs
+    -- logDebug ("scan for timeouts at " ++ show now)
     let RequestMap (tvar1, tvar2) = requestMap
-    (retries, timeouts) <- STM.atomically (do
+    (retries, timeouts) <- MonadIO.liftIO $ STM.atomically (do
         map2 <- TVar.readTVar tvar2
         -- filter to requests whose next-timeout has passed
         -- i.e. is less than now.
@@ -524,16 +580,18 @@ timeoutHarvester requestQueue resultQueue requestMap = do
         -- In either case remove the request from the map
         return (List.partition ((> 0) . requestRetries) requests)
         )
-    mapM_ (deleteFromMap requestMap) (retries ++ timeouts)
-    mapM_ (resendRequest requestQueue) retries
-    mapM_ (sendTimeoutToStore resultQueue) timeouts
+    mapM_ deleteFromMap retries
+    mapM_ deleteFromMap timeouts
+    mapM_ resendRequest retries
+    mapM_ sendTimeoutToStore timeouts
     -- Pause for a second between scans
-    Concurrent.threadDelay 1000000
-    timeoutHarvester requestQueue resultQueue requestMap
+    MonadIO.liftIO (Concurrent.threadDelay 1000000)
+    timeoutHarvester
 
 
-testRequestsToPoller :: TBQueue.TBQueue PollRequest -> IO ()
-testRequestsToPoller reqQ = do
+testRequestsToPoller :: PollerM ()
+testRequestsToPoller = do
+    requestQueue <- askRequestQueue
     -- let ifOutOctets_1 = ".1.3.6.1.2.1.2.2.1.16.1"
     let ifOutOctets_1 = ".1.0.0"
     let req = PollRequest
@@ -543,16 +601,18 @@ testRequestsToPoller reqQ = do
             , requestRoutingToken = "nid"
             , requestPollerType = "snmp"
             , requestInterval = 300
+            , requestIntervalRange = (0, 299)
             , requestTimeout = 3
             , requestRetries = 3
             , requestNextTimeout = 0
             , requestMeasurements = [(256, "id", [ifOutOctets_1])]
             }
-    STM.atomically (TBQueue.writeTBQueue reqQ req)
+    logDebug "push request"
+    MonadIO.liftIO $ STM.atomically (TBQueue.writeTBQueue requestQueue req)
     let loop = do
             -- micro seconds
-            Concurrent.threadDelay 5000000
-            IO.putStrLn "push request"
-            STM.atomically (TBQueue.writeTBQueue reqQ req)
+            MonadIO.liftIO $ Concurrent.threadDelay 5000000
+            logDebug "push request"
+            MonadIO.liftIO $ STM.atomically (TBQueue.writeTBQueue requestQueue req)
             loop
     loop

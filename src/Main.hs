@@ -3,48 +3,35 @@ module Main where
 
 import qualified Control.Concurrent as Concurrent
 import qualified Control.Concurrent.STM.TBQueue as TBQueue
-import qualified Data.Foldable as Foldable
--- import qualified Data.Map.Strict as Map
-import qualified Data.Text as Text
-import qualified Data.Text.IO as TextIO
+import qualified Control.Monad.Trans.Reader as Reader
 import qualified Network.Socket as Socket
-import qualified Network.Socket.ByteString as SocketBS
-import qualified System.IO as IO
-import qualified Network.Protocol.SNMP.Process as SNMP
-import qualified Network.Protocol.SNMP.UDP as UDP
--- import qualified Network.Protocol.NetSNMP as NetSNMP
 
 import qualified Netpoll.Poller as Poller
 import qualified Netpoll.Scheduler as Scheduler
+import qualified System.Log as Log
 
 
-printResults :: Either SNMP.ErrorMsg [SNMP.SNMPResult] -> IO ()
-printResults results = 
-    case results of
-        Left _ -> IO.putStrLn (show results)
-        Right snmpresults -> Foldable.mapM_ IO.putStrLn (map show snmpresults)
-
-
-printResult :: Either SNMP.ErrorMsg Text.Text -> IO ()
-printResult result =
-    case result of
-        Left _ -> IO.putStrLn (show result)
-        Right oid -> TextIO.putStrLn oid
-
--- TOTO
--- add logging
--- use ReaderT in poller to manage args
+-- TODO
+-- DONE: add logging
+-- DONE: use ReaderT in poller to manage args
 -- add postgres
+-- build datastore
+-- design configurator and matcher
+-- build archiver
 
 main :: IO ()
 main = do
     socket <- Socket.socket Socket.AF_INET Socket.Datagram 0
-    sockaddr <- Poller.getSockAddr "127.0.0.1" 44444
+    -- sockaddr <- Poller.getSockAddr "127.0.0.1" 44444
+    sockaddr <- Poller.getSockAddr "0.0.0.0" 44444
     Socket.bind socket sockaddr
     reqQ <- TBQueue.newTBQueueIO 10
     resQ <- TBQueue.newTBQueueIO 10
     reqM <- Poller.mkRequestMap
-    Concurrent.forkIO (Poller.poller socket reqQ reqM)
-    Concurrent.forkIO (Poller.listener socket reqQ resQ reqM)
-    Concurrent.forkIO (Poller.timeoutHarvester reqQ resQ reqM)
-    Poller.testRequestsToPoller reqQ
+    logger <- Log.createLogger Nothing 10000000 9
+    let pollerEnv = Poller.PollerEnv (reqM, reqQ, resQ, socket, logger)
+    -- TODO moar Async
+    Concurrent.forkIO (Reader.runReaderT Poller.poller pollerEnv)
+    Concurrent.forkIO (Reader.runReaderT Poller.listener pollerEnv)
+    Concurrent.forkIO (Reader.runReaderT Poller.timeoutHarvester pollerEnv)
+    Reader.runReaderT Poller.testRequestsToPoller pollerEnv

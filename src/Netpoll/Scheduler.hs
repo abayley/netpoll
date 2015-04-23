@@ -57,6 +57,7 @@ PK: request_id, dataseries_id, value
   (request_id, dataseries_id) FK to request_measurement
 -}
 
+-- {-# LANGUAGE ScopedTypeVariables #-}
 module Netpoll.Scheduler where
 
 import qualified Control.Concurrent.STM as STM
@@ -145,26 +146,29 @@ deleteRequestFromSchedules request schedules = do
 
 deleteRequestFromSchedule :: Poller.PollRequest -> Schedule -> IO ()
 deleteRequestFromSchedule request schedule = do
-    let Schedule (tvLastSlot, slots) = schedule
+    let Schedule (_, slots) = schedule
     (l, u) <- IOArray.getBounds slots
-    del slots [l..u]
+    delFromSlots request slots [l..u]
     where
     -- iterate over the slots, but stop when we find one containing
     -- our schedule.
-    del slots [] = return ()
-    del slots (i:is) = do
+    delFromSlots :: Poller.PollRequest -> SlotArray -> [Word.Word16] -> IO ()
+    delFromSlots request slots [] = return ()
+    delFromSlots request slots (i:is) = do
         tvpolls <- IOArray.readArray slots i
         found <- STM.atomically ( do
             polls <- TVar.readTVar tvpolls
-            let fpolls = filter (\r -> Poller.requestId request == Poller.requestId r) polls
-            if List.length polls /= List.length fpolls
-                -- only update the TVar if we've removed something from the list
-                then TVar.writeTVar tvpolls fpolls >> return True
+            let matchIds r = Poller.requestId request == Poller.requestId r
+            let (discard, keep) = List.partition matchIds polls
+            -- only update the TVar if we've removed something from the list
+            if not (List.null discard)
+                then TVar.writeTVar tvpolls keep >> return True
                 else return False
             )
         if found
+            -- stop if we found something and deleted it
             then return ()
-            else del slots is
+            else delFromSlots request slots is
 
 
 -- Loop over the range of slots that the request allows.
@@ -183,11 +187,13 @@ addRequestToSchedule request schedule = do
     tvpolls <- IOArray.readArray slots minSlot
     STM.atomically (TVar.modifyTVar' tvpolls (request:))
     where
+    findMinSlot :: Word.Word16 -> Word.Word16 -> SlotArray -> [Word.Word16] -> IO Word.Word16
     findMinSlot m s slots [] = return m
     findMinSlot m s slots (i:is) = do
         polls <- IOArray.readArray slots i >>= TVar.readTVarIO
         let l = fromIntegral (List.length polls)
         if l > m
+        -- this current slot (i, len l) is bigger than best so far (s, len m)
         then findMinSlot m s slots is
         -- this current slot is best so far
         else findMinSlot l i slots is
