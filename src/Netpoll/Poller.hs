@@ -71,46 +71,6 @@ next-timeout (i.e. time at which request is deemed to
 have timed out).
 
 
-Datastore
----------
-An SQL database (pref postgres) with a highres table partitioned
-by day, and lower-res tables:
- - 15 min
- - hourly
- - daily
-
-An archiver process runs every 15 mins and rolls up the highres
-data into the lower-res tables. It also precreates partitions
-as required.
-
-Partitions:
-  - highres: by day
-  - 15min/hourly: by month
-  - daily: not at all
-
-The table structures:
-  - highres:
-        dataseries_id :: int
-        ts :: timestamp
-        value :: double
-        valid_ind :: int
-
-  - lowres:
-        dataseries_id :: int
-        ts :: timestamp
-        cnt :: int
-        avg :: double
-        sum :: double
-        max :: double
-        min :: double
-        stddev :: double
-
-Tables could be called:
-   - measure_highres
-   - measure_15min
-   - measure_hourly
-   - measure_daily
-
 
 Configuration database
 ----------------------
@@ -158,6 +118,9 @@ import qualified System.Log as Log
 import qualified Network.Protocol.SNMP.UDP as SnmpUDP
 
 
+-- dataseries-id, next-timeout, timestamp
+-- are all Ints because they are used as keys into IntMaps.
+
 data PollRequest = PollRequest {
     requestId :: String,  -- unique id
     requestAddress :: String,  -- ip
@@ -178,6 +141,7 @@ data PollResult = PollResult {
     resultId :: String,  -- unique id, same as requestId
     resultRoutingToken :: String,  -- for store
     resultDataseriesId :: Int,
+    resultTimestamp :: Int,  -- seconds since epoch
     resultValue :: Double,
     -- 0 == ok, 1 == timeout, 2 == error
     resultErrorCode :: Int,
@@ -240,10 +204,28 @@ askRequestQueue = do
     return requestQueue
 
 
+askResultQueue :: PollerM (TBQueue.TBQueue PollResult)
+askResultQueue = do
+    PollerEnv (_, _, resultQueue, _, _) <- Reader.ask
+    return resultQueue
+
+
 askSocket :: PollerM Socket.Socket
 askSocket = do
     PollerEnv (_, _, _, socket, _) <- Reader.ask
     return socket
+
+
+askLogger :: PollerM Log.Logger
+askLogger = do
+    PollerEnv (_, _, _, _, l) <- Reader.ask
+    return l
+
+
+logError :: String -> PollerM ()
+logError msg = askLogger >>= MonadIO.liftIO . flip Log.error msg
+logDebug :: String -> PollerM ()
+logDebug msg = askLogger >>= MonadIO.liftIO . flip Log.debug msg
 
 
 addRequestToMap :: PollRequest -> PollerM ()
@@ -389,36 +371,115 @@ resendRequest request = do
     MonadIO.liftIO $ STM.atomically (TBQueue.writeTBQueue requestQueue newReq)
 
 
-sendMeasure oidvals (dsId, calc, oids) = do
-    return ()
+makePollResult :: PollRequest -> Int -> Int -> Double -> Int -> Int -> PollResult
+makePollResult request dsId ts val err1 err2 =
+    PollResult
+        { resultId = requestId request
+        , resultRoutingToken = requestRoutingToken request
+        , resultDataseriesId = dsId
+        , resultTimestamp = ts
+        , resultValue = val
+        -- 0 == ok, 1 == timeout, 2 == error
+        , resultErrorCode = err1
+        -- secondary error code e.g. snmp error
+        , resultErrorCode2 = err2
+        }
+
+
+snmpNumVal :: SnmpUDP.SnmpResponse -> Double
+snmpNumVal (SnmpUDP.SnmpInt i) = fromIntegral i
+snmpNumVal (SnmpUDP.SnmpWord i) = fromIntegral i
+snmpNumVal _ = error "not numeric snmp result"
+
+
+pct_a_b :: [Double] -> Double
+pct_a_b (a:b:_) = a / (a+b)
+
+sendMeasure :: PollRequest -> [(String, SnmpUDP.SnmpResponse)] -> (Int, String, [String]) -> PollerM ()
+sendMeasure request oidvals (dsId, calc, oids) = do
+    -- extract the oids from the response (using List.lookup)
+    -- in the same order they are in oids.
+    let mbvals = List.map ((flip List.lookup) oidvals) oids
+    -- filter to just the oids that were returned bythe device
+    -- (remove the Nothings)
+    let snmpvals = List.map Maybe.fromJust . List.filter Maybe.isJust $ mbvals
+    -- build a sepaate sublist of bad oids
+    let isBad (SnmpUDP.SnmpBadOid _) = True
+        isBad _ = False
+    let bads = List.filter isBad snmpvals
+    ts <- MonadIO.liftIO $ getPOSIXSecs
+    resultQueue <- askResultQueue
+    -- If we have any bad oids then the entire measurement has failed,
+    -- so forward an error result.
+    if not (null bads)
+    then do
+        let (SnmpUDP.SnmpBadOid e) = List.head bads
+        let result = makePollResult request dsId ts 0 2 (fromIntegral e)
+        MonadIO.liftIO $ STM.atomically (TBQueue.writeTBQueue resultQueue result)
+    else do
+        -- FIXME handle binned data polling, where we get the
+        -- bin timestamp along with the value to poll.
+        -- Perhaps have a special calculator type for binned,
+        -- where the request has 2 oids: one for the value,
+        -- and the other for the bin timestamp.
+        let vals = map snmpNumVal snmpvals
+        let v = case calc of
+                "sum" -> List.sum vals
+                "avg" -> List.sum vals / (fromIntegral (List.length vals))
+                "pct" -> pct_a_b vals
+        let result = makePollResult request dsId ts v 0 0
+        MonadIO.liftIO $ STM.atomically (TBQueue.writeTBQueue resultQueue result)
 
 
 -- Get the oids and values, apply any post-processing,
 -- construct the PollResults, and send onwards.
 sendResultToStore :: PollRequest -> SnmpUDP.SnmpResponse -> PollerM ()
 sendResultToStore request response = do
-    -- PollerEnv (requestMap, requestQueue, resultQueue, socket) <- Reader.ask
-    -- FIXME implement
     logDebug ("send result to store: " ++ show (requestId request))
     let oidvals = getSnmpRespOidVals response
-    mapM_ (sendMeasure oidvals) (requestMeasurements request)
-    return ()
+    mapM_ (sendMeasure request oidvals) (requestMeasurements request)
 
 
+sendMeasureError :: PollRequest -> Int -> Int -> (Int, String, [String]) -> PollerM ()
+sendMeasureError request e1 e2 (dsId, _, _) = do
+    ts <- MonadIO.liftIO $ getPOSIXSecs
+    let result = makePollResult request dsId ts 0 e1 e2
+    resultQueue <- askResultQueue
+    MonadIO.liftIO $ STM.atomically (TBQueue.writeTBQueue resultQueue result)
+
+
+{-
+snmp response error codes:
+1 - too big - the response PDU would be too big
+2 - no such name - the name of a requested object was not found
+3 - bad value - incorrect type or length
+4 - read only - tried to set a read-only variable
+5 - generic - some other error not in this list
+6 - no access - access denied for security reasons
+7 - wrong type - incorrect type for an object
+8 - wrong length
+9 - wrong encoding
+10 - wrong value - var bind contains value out of range e.g. enums
+11 - no creation - variable does not exist, cannot be created
+12 - inconsistent value - in range but not possible in current state
+13 - resource unavailable - for set
+14 - commit failed - a set failed
+15 - undo failed - set failed, then undo failed (when setting a group)
+16 - auth error
+17 - not writable
+18 - inconsistent name - name in var bind names something that does not exist
+-}
 sendErrorToStore :: PollRequest -> SnmpUDP.SnmpResponse -> PollerM ()
 sendErrorToStore request response = do
-    -- PollerEnv (requestMap, requestQueue, resultQueue, socket) <- Reader.ask
-    -- FIXME implement
     logDebug ("send error to store: " ++ show (requestId request))
-    return ()
+    let (errStatus, _) = getSnmpRespError response
+    mapM_ (sendMeasureError request 2 errStatus) (requestMeasurements request)
 
 
 sendTimeoutToStore :: PollRequest -> PollerM ()
 sendTimeoutToStore request = do
-    -- PollerEnv (requestMap, requestQueue, resultQueue, socket) <- Reader.ask
-    -- FIXME implement
     logDebug ("request timeout: " ++ requestId request)
-    return ()
+    mapM_ (sendMeasureError request 1 0) (requestMeasurements request)
 
 
 requestOids :: PollRequest -> [String]
@@ -459,16 +520,6 @@ oidsMatch request response =
     Set.fromList (getSnmpRespOids response) == Set.fromList (requestOids request)
 
 
-logError :: String -> PollerM ()
-logError msg = do
-    PollerEnv (_, _, _, _, logger) <- Reader.ask
-    MonadIO.liftIO (Log.error logger msg)
-logDebug :: String -> PollerM ()
-logDebug msg = do
-    PollerEnv (_, _, _, _, logger) <- Reader.ask
-    MonadIO.liftIO (Log.debug logger msg)
-
-
 poller :: PollerM ()
 poller = do
     socket <- askSocket
@@ -493,27 +544,6 @@ poller = do
     poller
 
 
-{-
-snmp response error codes:
-1 - too big - the response PDU would be too big
-2 - no such name - the name of a requested object was not found
-3 - bad value - incorrect type or length
-4 - read only - tried to set a read-only variable
-5 - generic - some other error not in this list
-6 - no access - access denied for security reasons
-7 - wrong type - incorrect type for an object
-8 - wrong length
-9 - wrong encoding
-10 - wrong value - var bind contains value out of range e.g. enums
-11 - no creation - variable does not exist, cannot be created
-12 - inconsistent value - in range but not possible in current state
-13 - resource unavailable - for set
-14 - commit failed - a set failed
-15 - undo failed - set failed, then undo failed (when setting a group)
-16 - auth error
-17 - not writable
-18 - inconsistent name - name in var bind names something that does not exist
--}
 processResponse :: BS.ByteString -> String -> PollerM ()
 processResponse msg ipaddr = do
     either logError processParsedResponse (SnmpUDP.parseSnmpResponse msg)
@@ -527,17 +557,21 @@ processResponse msg ipaddr = do
         then do
             logError ("processResponse: no request for id " ++ show reqId)
         else do
-            -- FIXME check ip addresses match
             let request = Maybe.fromJust mbReq
-            let (errStatus, errIndex) = getSnmpRespError response
-            -- FIXME check response error codes
-            logDebug ("processResponse: found request for id " ++ show reqId)
-            deleteFromMap request
-            if errStatus /= 0
-            then sendErrorToStore request response
-            else if oidsMatch request response
-                then sendResultToStore request response
-                else resendRequest request
+            let reqip = requestAddress request
+            -- check ip addresses match
+            if ipaddr /= reqip
+            then do
+                logError ("processResponse: ip mismatch: request: " ++ reqip ++ " network: " ++ ipaddr)
+            else do
+                let (errStatus, errIndex) = getSnmpRespError response
+                logDebug ("processResponse: found request for id " ++ show reqId)
+                deleteFromMap request
+                if errStatus /= 0
+                then sendErrorToStore request response
+                else if oidsMatch request response
+                    then sendResultToStore request response
+                    else resendRequest request
 
 
 listener :: PollerM ()
@@ -589,24 +623,34 @@ timeoutHarvester = do
     timeoutHarvester
 
 
+mkRequest :: String
+    -> String
+    -> String
+    -> Word.Word16
+    -> [(Int, String, [String])]
+    -> PollRequest
+mkRequest reqId addr community interval measurements =
+    PollRequest
+        { requestId = reqId
+        , requestAddress = addr
+        , requestAuthToken = community
+        , requestRoutingToken = "nid"
+        , requestPollerType = "snmp"
+        , requestInterval = interval
+        , requestIntervalRange = (0, interval - 1)
+        , requestTimeout = 3
+        , requestRetries = 3
+        , requestNextTimeout = 0
+        , requestMeasurements = measurements
+        }
+
+
 testRequestsToPoller :: PollerM ()
 testRequestsToPoller = do
     requestQueue <- askRequestQueue
     -- let ifOutOctets_1 = ".1.3.6.1.2.1.2.2.1.16.1"
     let ifOutOctets_1 = ".1.0.0"
-    let req = PollRequest
-            { requestId = "req1"
-            , requestAddress = "127.0.0.1"
-            , requestAuthToken = "public"
-            , requestRoutingToken = "nid"
-            , requestPollerType = "snmp"
-            , requestInterval = 300
-            , requestIntervalRange = (0, 299)
-            , requestTimeout = 3
-            , requestRetries = 3
-            , requestNextTimeout = 0
-            , requestMeasurements = [(256, "id", [ifOutOctets_1])]
-            }
+    let req = mkRequest "req1" "127.0.0.1" "public" 300 [(256, "id", [ifOutOctets_1])]
     logDebug "push request"
     MonadIO.liftIO $ STM.atomically (TBQueue.writeTBQueue requestQueue req)
     let loop = do

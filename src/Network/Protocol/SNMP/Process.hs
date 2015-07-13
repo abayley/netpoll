@@ -26,8 +26,6 @@ import qualified Data.Word as Word
 import qualified System.Exit as Exit
 import qualified System.Process.Text as ProcessText
 import qualified Text.Read as Read
--- import qualified Data.Text.IO as TextIO
--- import qualified System.IO as IO
 
 
 -- INTEGER and Integer32 are indistinguishable
@@ -35,7 +33,7 @@ import qualified Text.Read as Read
 
 -- SNMPValue combines type and value.
 -- Not sure if this is a good idea or not.
-data SNMPValue = 
+data SNMPValue =
     Integer Int Text.Text
     | TruthValue Bool
     | Timeticks Word.Word32
@@ -65,22 +63,25 @@ type SNMPResult = (Text.Text, SNMPValue)
 type SNMPTableRow = Map.Map Text.Text SNMPValue
 type SNMPTable = Map.Map NumericOID SNMPTableRow
 
--- FIXME TODO add iterations, timeouts, retries
 data SNMPOptions = SNMPOptions
     { snmpVersion :: String
     , snmpMibs :: [String]
     , snmpFlags :: [String]
     , snmpInputOpts :: String
     , snmpOutputOpts :: String
+    , snmpIterations :: Int
+    , snmpTimeout :: Int
+    , snmpRetries :: Int
     , snmpCommand :: String
     , snmpSession :: SNMPSession
     }
     deriving (Eq)
 
+
 defaultOptions :: IO SNMPOptions
 defaultOptions = do
     sess <- defaultSession
-    return (SNMPOptions "2c" [] ["-Pud"] "" "f" "snmpget" sess)
+    return (SNMPOptions "2c" [] ["-Pud"] "" "f" 25 1 4 "snmpget" sess)
 
 
 type TranslationCache = IORef.IORef (Map.Map Text.Text Text.Text)
@@ -124,7 +125,7 @@ readText def s = case Read.readEither . Text.unpack $ s of
 -- i.e. the first one is like an enum.
 -- This function handles both cases.
 parseInteger :: Text.Text -> SNMPValue
-parseInteger s = 
+parseInteger s =
     if hasParens s
         then Integer (readText 0 . betweenParens $ s) (beforeParens s)
         else Integer (readText 0 . Text.takeWhile Char.isDigit $ s) (Text.empty)
@@ -166,7 +167,7 @@ buildSnmpOpts prefix options =
 
 
 commonSnmpOpts :: SNMPOptions -> [String]
-commonSnmpOpts options = 
+commonSnmpOpts options =
     snmpFlags options ++ inputOpts ++ outputOpts ++ mibs
     where
         mibs = buildSnmpOpts "-m" (List.intercalate "," (snmpMibs options))
@@ -174,12 +175,17 @@ commonSnmpOpts options =
         outputOpts = buildSnmpOpts "-O" (snmpOutputOpts options)
 
 
+timeoutSnmpOpts :: SNMPOptions -> [String]
+timeoutSnmpOpts options = ["-t", show (snmpTimeout options), "-r", show (snmpRetries options)]
+
+
 -- | An snmp command that returns one or more values,
 -- one value per line, in the format:
 -- oid = type: value
+-- This function is the base of snmpGet, snmpWalk, snmpTable.
 snmpGetMultiple :: HostName -> [OID] -> Community -> SNMPOptions -> IO (Either ErrorMsg [SNMPResult])
 snmpGetMultiple hostName oids community options = do
-    let opts = ["-v", snmpVersion options, "-c", community] ++ commonSnmpOpts options
+    let opts = ["-v", snmpVersion options, "-c", community] ++ commonSnmpOpts options ++ timeoutSnmpOpts options
     let args = opts ++ [hostName] ++ oids
     (exitCode, _stdout, _stderr) <- ProcessText.readProcessWithExitCode (snmpCommand options) args Text.empty
     case exitCode of
@@ -209,9 +215,9 @@ snmpGet = snmpGetMultiple
 -- both use -t n -r n -OfU -Pud
 -- snmpget uses -t n -r n -OnU -Pud
 
-snmpWalk :: HostName -> OID -> Community -> SNMPOptions -> Int -> IO (Either ErrorMsg [SNMPResult])
-snmpWalk hostName oid community options iterations = do
-    let opts = options {snmpCommand = "snmpbulkwalk", snmpFlags = ["-Pud", "-Cr" ++ show iterations]}
+snmpWalk :: HostName -> OID -> Community -> SNMPOptions -> IO (Either ErrorMsg [SNMPResult])
+snmpWalk hostName oid community options = do
+    let opts = options {snmpCommand = "snmpbulkwalk", snmpFlags = ["-Cr" ++ show (snmpIterations options)]}
     snmpGetMultiple hostName [oid] community opts
 
 
@@ -229,7 +235,7 @@ addToCache cache oid result = do
 -- to snmpTranslate.
 -- This is where we check the cache, and if the oid is not
 -- in the cache, call the external command and add the result
--- to the cache.    
+-- to the cache.
 snmpCacheTranslate :: TranslationCache -> Text.Text -> SNMPOptions -> IO (Either ErrorMsg Text.Text)
 snmpCacheTranslate cache oid options = do
     mapping <- IORef.readIORef cache
@@ -306,7 +312,7 @@ parseSNMPTable tableOid options results = do
     parseTable prefix table (r:rs) = do
         let (oid, value) = r
         -- After removing the table prefix the OID will be
-        -- ".entry.column.index". strip will turn this into
+        -- ".entry.column.index". splitOn will turn this into
         -- ["", "entry", "column", "index1", "index2", ...]
         -- and we want to recover "column" and "index".
         let (colname:indexlist) = drop 2 (Text.splitOn "." (stripPrefix prefix oid))
@@ -328,7 +334,7 @@ parseSNMPTable tableOid options results = do
 snmpTable :: HostName -> OID -> [String]-> Community -> SNMPOptions -> IO (Either ErrorMsg SNMPTable)
 snmpTable hostName oid columns community options = do
     result <- case columns of
-        [] -> snmpWalk hostName oid community options 25
+        [] -> snmpWalk hostName oid community options
         -- If the user has specified columns, then we walk each
         -- column separately and join the results together.
         _ -> do
@@ -336,7 +342,7 @@ snmpTable hostName oid columns community options = do
             -- walks, but the return type is Either.
             -- Stop on the first Left.
             results <- Error.runErrorT . Traversable.sequenceA .
-                map (\col -> Error.ErrorT (snmpWalk hostName col community options 25)) $ columns
+                map (\col -> Error.ErrorT (snmpWalk hostName col community options)) $ columns
             return (either Left (Right . concat) results)
     case result of
         Left errmsg -> return (Left errmsg)

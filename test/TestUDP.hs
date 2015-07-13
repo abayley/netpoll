@@ -62,6 +62,7 @@ test_berLength = "test_berLength" ~: HUnit.TestCase $ do
     UDP.berLength 65536 @?= [131, 1, 0, 0]
 
 
+compareLBS :: LazyBS.ByteString -> LazyBS.ByteString -> HUnit.Assertion
 compareLBS actual expect = do
     UDP.prettyHex (LazyBS.toStrict actual) @?= UDP.prettyHex (LazyBS.toStrict expect)
 
@@ -88,7 +89,10 @@ test_encodeBERString = "encodeBERString" ~: HUnit.TestCase $ do
         (UDP.encodeBERString "a")
         (LazyBS.pack [4, 1, 97])
 
+
+ifTableOid :: String
 ifTableOid = ".1.3.6.1.2.1.2.2.0"
+
 
 test_encodeBEROid :: HUnit.Test
 test_encodeBEROid = "test_encodeBEROid" ~: HUnit.TestCase $ do
@@ -140,8 +144,8 @@ test_makeGetRequest = "test_makeGetRequest" ~: HUnit.TestCase $ do
             []))
 
 
-udpTests :: HUnit.Test
-udpTests = HUnit.TestList (
+tests :: HUnit.Test
+tests = HUnit.TestList (
     test_word2Words :
     test_words2Int :
     test_int2Words :

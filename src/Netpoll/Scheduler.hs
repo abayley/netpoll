@@ -32,6 +32,9 @@ in the cycle e.g. as close as possible to the start.
 Database design
 ---------------
 schedule:
+PK: interval
+
+schedule_slot:
 PK: interval, slot
   0 <= slot < interval
 
@@ -39,7 +42,7 @@ PK: interval, slot
 -- slot we could use this structure:
 request_slot:
 PK: request_id
-  (interval, slot) FK to schedule
+  (interval, slot) FK to schedule_slot
   0 <= slot < interval
 
 request:
@@ -63,6 +66,8 @@ module Netpoll.Scheduler where
 import qualified Control.Concurrent.STM as STM
 import qualified Control.Concurrent.STM.TVar as TVar
 import qualified Control.Concurrent.STM.TBQueue as TBQueue
+import qualified Control.Monad.IO.Class as MonadIO
+import qualified Control.Monad.Trans.Reader as Reader
 import qualified Data.Array.IO as IOArray
 import qualified Data.Foldable as Foldable
 import qualified Data.List as List
@@ -70,8 +75,11 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Time.Clock.POSIX as POSIX
 import qualified Data.Traversable as Traversable
 import qualified Data.Word as Word
+import qualified Database.PostgreSQL.Simple as Postgres
 
 import qualified Netpoll.Poller as Poller
+import qualified Netpoll.Database as Database
+import qualified System.Log as Log
 
 
 -- A schedule is a pair of the last slot sent and an array of slots.
@@ -88,6 +96,57 @@ newtype Schedule = Schedule (TVar.TVar Word.Word16, SlotArray)
 -- Only updated when a new frequency is introduced.
 newtype Schedules = Schedules
     (TVar.TVar (Map.Map Word.Word16 Schedule))
+
+newtype SchedulerEnv = SchedulerEnv
+    ( Schedules
+    , TBQueue.TBQueue Poller.PollRequest
+    , Postgres.Connection
+    , Log.Logger
+    )
+
+
+type SchedulerM = Reader.ReaderT SchedulerEnv IO
+
+
+mkSchedules :: IO Schedules
+mkSchedules = do
+    tvar <- STM.atomically (TVar.newTVar Map.empty)
+    return (Schedules tvar)
+
+
+askSchedules :: SchedulerM Schedules
+askSchedules = do
+    SchedulerEnv (s, _, _, _) <- Reader.ask
+    return s
+
+
+askRequestQueue :: SchedulerM (TBQueue.TBQueue Poller.PollRequest)
+askRequestQueue = do
+    SchedulerEnv (_, rq, _, _) <- Reader.ask
+    return rq
+
+
+askDBConn :: SchedulerM Postgres.Connection
+askDBConn = do
+    SchedulerEnv (_, _, c, _) <- Reader.ask
+    return c
+
+
+askLogger :: SchedulerM Log.Logger
+askLogger = do
+    SchedulerEnv (_, _, _, l) <- Reader.ask
+    return l
+
+
+logError :: String -> SchedulerM ()
+logError msg = askLogger >>= MonadIO.liftIO . flip Log.error msg
+logDebug :: String -> SchedulerM ()
+logDebug msg = askLogger >>= MonadIO.liftIO . flip Log.debug msg
+
+
+-- avoid writing MonadIO.liftIO $ STM.atomically ...
+atomicallyM :: MonadIO.MonadIO m => STM.STM a -> m a
+atomicallyM a = MonadIO.liftIO (STM.atomically a)
 
 
 -- If the request interval already exists in the map,
@@ -106,40 +165,87 @@ newtype Schedules = Schedules
 -- and re-insert.
 -- It is possible that the request has changed its frequency,
 -- so we'll have to search all schedules for it.
-addRequestToSchedules :: Schedules -> Poller.PollRequest -> IO ()
-addRequestToSchedules schedules request = do
+addRequestToSchedules :: Poller.PollRequest -> SchedulerM ()
+addRequestToSchedules request = do
+    logDebug "addRequestToSchedules: start"
+    schedules <- askSchedules
+    conn <- askDBConn
     let Schedules tvar = schedules
-    schedMap <- TVar.readTVarIO tvar
+    logDebug "addRequestToSchedules: deleteRequestFromSchedules"
+    deleteRequestFromSchedules request
+
+    -- Does the schedule for the new interval exist?
+    -- If not then we'd better make a new one.
+    schedMap <- MonadIO.liftIO $ TVar.readTVarIO tvar
     let interval = Poller.requestInterval request
-    case Map.lookup interval schedMap of
+    schedule <- case Map.lookup interval schedMap of
+        Just s -> return s
         Nothing -> do
-            s <- createSchedule interval
-            STM.atomically (TVar.modifyTVar' tvar (Map.insert interval s))
-            addRequestToSchedule request s
-        Just schedule -> do
-            deleteRequestFromSchedules request schedules
-            addRequestToSchedule request schedule
+            logDebug "addRequestToSchedules: createSchedule"
+            s <- MonadIO.liftIO $ createSchedule interval
+            atomicallyM (TVar.modifyTVar' tvar (Map.insert interval s))
+            logDebug "addRequestToSchedules: Database.createSchedule"
+            MonadIO.liftIO $ Database.createSchedule conn interval
+            return s
+
+    logDebug "addRequestToSchedules: addRequestToSchedule"
+    -- Having established that a schedule exists, add the request to it.
+    slot <- MonadIO.liftIO $ addRequestToSchedule request schedule
+    logDebug "addRequestToSchedules: Database.addRequestToSchedule"
+    MonadIO.liftIO $ Database.addRequestToSchedule conn interval slot request
+    logDebug "addRequestToSchedules: done"
+
+
+loadSchedulesFromDatabase :: SchedulerM ()
+loadSchedulesFromDatabase = do
+    logDebug "loadSchedulesFromDatabase: start"
+    conn <- askDBConn
+    logDebug "loadSchedulesFromDatabase: Database.getSchedules"
+    intervals <- MonadIO.liftIO (Database.getSchedules conn)
+    -- Turn the list of intervals into an interval -> Schedule map
+    ss <- Traversable.forM intervals $ \interval -> do
+        -- Create a schedule with every slot populated with an empty list.
+        schedule <- MonadIO.liftIO (createSchedule interval)
+        logDebug ("loadSchedulesFromDatabase: Database.getRequestsForInterval " ++ show interval)
+        requests <- MonadIO.liftIO (Database.getRequestsForInterval conn interval)
+        let Schedule (_, slots) = schedule
+        -- Each slot in the array is a TVar storing the list of PollRequests.
+        Foldable.forM_ requests $ \(slot, slotReqs) -> do
+            tvpolls <- MonadIO.liftIO (IOArray.readArray slots slot)
+            atomicallyM (TVar.writeTVar tvpolls slotReqs)
+        return schedule
+    let smap = Map.fromList (List.zip intervals ss)
+    -- replace whatever was there
+    schedules <- askSchedules
+    let Schedules tvar = schedules
+    atomicallyM (TVar.writeTVar tvar smap)
+    logDebug "loadSchedulesFromDatabase: done"
 
 
 createSchedule :: Word.Word16 -> IO Schedule
 createSchedule interval = do
-    tvars <- Traversable.mapM
+    -- These TVars wrap (initially empty) lists of PollRequests.
+    -- We need a list of TVars from which to construct the array.
+    reqTvars <- Traversable.mapM
         (STM.atomically . TVar.newTVar)
         (replicate (fromIntegral interval) [])
-    a <- IOArray.newListArray (0, interval - 1) tvars
+    array <- IOArray.newListArray (0, interval - 1) reqTvars
     tvarLastSlot <- STM.atomically (TVar.newTVar 0)
-    return (Schedule (tvarLastSlot, a))
+    return (Schedule (tvarLastSlot, array))
 
 
 -- Remove from array and database.
--- FIXME also delete from database
-deleteRequestFromSchedules :: Poller.PollRequest -> Schedules -> IO ()
-deleteRequestFromSchedules request schedules = do
+deleteRequestFromSchedules :: Poller.PollRequest -> SchedulerM ()
+deleteRequestFromSchedules request = do
+    conn <- askDBConn
+    logDebug "deleteRequestFromSchedules: Database.deleteRequestFromSchedules"
+    MonadIO.liftIO $ Database.deleteRequestFromSchedules conn request
+    schedules <- askSchedules
     let Schedules tvar = schedules
-    schedMap <- TVar.readTVarIO tvar
+    schedMap <- MonadIO.liftIO $ TVar.readTVarIO tvar
     -- for each frequency
     Foldable.mapM_
-        (deleteRequestFromSchedule request)
+        (MonadIO.liftIO . deleteRequestFromSchedule request)
         (Map.elems schedMap)
     return ()
 
@@ -148,13 +254,13 @@ deleteRequestFromSchedule :: Poller.PollRequest -> Schedule -> IO ()
 deleteRequestFromSchedule request schedule = do
     let Schedule (_, slots) = schedule
     (l, u) <- IOArray.getBounds slots
-    delFromSlots request slots [l..u]
+    delFromSlots slots [l..u]
     where
     -- iterate over the slots, but stop when we find one containing
     -- our schedule.
-    delFromSlots :: Poller.PollRequest -> SlotArray -> [Word.Word16] -> IO ()
-    delFromSlots request slots [] = return ()
-    delFromSlots request slots (i:is) = do
+    delFromSlots :: SlotArray -> [Word.Word16] -> IO ()
+    delFromSlots _ [] = return ()
+    delFromSlots slots (i:is) = do
         tvpolls <- IOArray.readArray slots i
         found <- STM.atomically ( do
             polls <- TVar.readTVar tvpolls
@@ -168,16 +274,15 @@ deleteRequestFromSchedule request schedule = do
         if found
             -- stop if we found something and deleted it
             then return ()
-            else delFromSlots request slots is
+            else delFromSlots slots is
 
 
 -- Loop over the range of slots that the request allows.
 -- Remember the slot with the least polls.
 -- Assumes request not already in schedule.
--- FIXME also add to database
-addRequestToSchedule :: Poller.PollRequest -> Schedule -> IO ()
+addRequestToSchedule :: Poller.PollRequest -> Schedule -> IO Word.Word16
 addRequestToSchedule request schedule = do
-    let Schedule (tvLastSlot, slots) = schedule
+    let Schedule (_, slots) = schedule
     -- Establish the range of slots to search: the intersection
     -- of the request bounds and the array bounds.
     (arrl, arru) <- IOArray.getBounds slots
@@ -186,9 +291,10 @@ addRequestToSchedule request schedule = do
     minSlot <- findMinSlot maxBound l slots [l..u]
     tvpolls <- IOArray.readArray slots minSlot
     STM.atomically (TVar.modifyTVar' tvpolls (request:))
+    return minSlot
     where
     findMinSlot :: Word.Word16 -> Word.Word16 -> SlotArray -> [Word.Word16] -> IO Word.Word16
-    findMinSlot m s slots [] = return m
+    findMinSlot m _ _ [] = return m
     findMinSlot m s slots (i:is) = do
         polls <- IOArray.readArray slots i >>= TVar.readTVarIO
         let l = fromIntegral (List.length polls)
@@ -218,14 +324,15 @@ getPOSIXSecs = do
 -- e.g. for a poll frequency of 900s (15 mins) when now is a multiple
 -- of 900 (i.e. now `mod` 900 == 0) then the time will be one of
 -- [hh:00:00, hh:15:00, hh:30:00, hh:45:00].
-tick :: Schedules -> TBQueue.TBQueue Poller.PollRequest -> IO ()
-tick schedules requestQueue = do
-    now <- getPOSIXSecs
+tick :: SchedulerM ()
+tick = do
+    schedules <- askSchedules
+    now <- MonadIO.liftIO getPOSIXSecs
     let Schedules tvar = schedules
-    schedMap <- TVar.readTVarIO tvar
+    schedMap <- MonadIO.liftIO $ TVar.readTVarIO tvar
     -- for each frequency
     Foldable.mapM_
-        (\(i, s) -> tickSchedule requestQueue now i s)
+        (\(i, s) -> tickSchedule now i s)
         (Map.assocs schedMap)
 
 
@@ -254,24 +361,25 @@ slotsToPoll interval start slot =
     else [start .. slot]
 
 
-tickSchedule :: TBQueue.TBQueue Poller.PollRequest -> Int -> Word.Word16 -> Schedule -> IO ()
-tickSchedule requestQueue now interval schedule = do
+tickSchedule :: Int -> Word.Word16 -> Schedule -> SchedulerM ()
+tickSchedule now interval schedule = do
     let slot = fromIntegral (now `mod` (fromIntegral interval))
     let Schedule (tvLastSlot, slots) = schedule
-    lastSlot <- TVar.readTVarIO tvLastSlot
+    lastSlot <- MonadIO.liftIO $ TVar.readTVarIO tvLastSlot
     -- If the difference between last and current is too large
     -- (>10s say) then discard the older polls.
     let start = dropOldPolls interval lastSlot slot
     Foldable.mapM_
-        (sendSlotPolls requestQueue slots)
+        (sendSlotPolls slots)
         (slotsToPoll interval start slot)
-    STM.atomically (TVar.writeTVar tvLastSlot slot)
+    atomicallyM (TVar.writeTVar tvLastSlot slot)
 
 
-sendSlotPolls :: TBQueue.TBQueue Poller.PollRequest -> SlotArray -> Word.Word16 -> IO ()
-sendSlotPolls requestQueue slots slot = do
-    tvpolls <- IOArray.readArray slots slot
-    STM.atomically (
+sendSlotPolls :: SlotArray -> Word.Word16 -> SchedulerM ()
+sendSlotPolls slots slot = do
+    requestQueue <- askRequestQueue
+    tvpolls <- MonadIO.liftIO $ IOArray.readArray slots slot
+    MonadIO.liftIO $ STM.atomically (
         TVar.readTVar tvpolls >>=
         Foldable.mapM_ (TBQueue.writeTBQueue requestQueue)
         )

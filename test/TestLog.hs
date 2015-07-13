@@ -10,6 +10,7 @@ test_logger = "logger" ~: HUnit.TestCase $ do
     loop 1000 logger
     Log.stopLogger logger
     where
+    loop :: Int -> Log.Logger -> IO ()
     loop 0 _ = return ()
     loop n logger = do
         let sn = show n

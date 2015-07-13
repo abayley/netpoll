@@ -140,15 +140,13 @@ rotateFiles path n = mapM_ move srcdsts
 
 rpad :: String -> Int -> String
 rpad str n = let l = List.length str in
-    str ++ (take (n-l) (repeat ' '))
+    str ++ replicate (n-l) ' '
 
 
 writeChan :: Level -> Logger -> String -> IO ()
 writeChan level logger msg = do
     threadId <- Concurrent.myThreadId
     let tid = drop 9 (show threadId)
-    -- now <- Clock.getCurrentTime
-    -- let format = "%Y-%m-%dT%H:%M:%S.%q"
     let format = "%Y-%m-%dT%H:%M:%S.%q"
     now <- LocalTime.getZonedTime
     let tz = TimeFormat.formatTime TimeFormat.defaultTimeLocale "%z" now

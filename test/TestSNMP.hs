@@ -64,7 +64,7 @@ test_snmpWalk :: HUnit.Test
 test_snmpWalk = HUnit.TestCase $ do
     options1 <- SNMP.defaultOptions
     let options = options1 { SNMP.snmpOutputOpts = "fU"}
-    result <- SNMP.snmpWalk "localhost" "ifIndex" "public" options 25
+    result <- SNMP.snmpWalk "localhost" "ifIndex" "public" options
     case result of
         Left errmsg -> HUnit.assertFailure (show errmsg)
         Right list -> do
@@ -165,12 +165,12 @@ test_snmpTranslateOidCached = "test_snmpTranslateOidCached" ~: HUnit.TestCase $ 
     HUnit.assertBool "t3 < 0.01" (t3 < 0.01)
 
 
-snmpTests :: HUnit.Test
-snmpTests = HUnit.TestList (
+tests :: HUnit.Test
+tests = HUnit.TestList (
     test_parseOid :
     test_snmpGet :
     test_snmpGetMulti :
-    test_snmpWalk :    
+    test_snmpWalk :
     test_snmpTable :
     test_snmpTableCols :
     test_snmpTableColsFailure :

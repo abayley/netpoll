@@ -5,10 +5,15 @@ import Test.HUnit as HUnit
 import qualified TestSNMP as TestSNMP
 import qualified TestUDP as TestUDP
 import qualified TestLog as TestLog
+import qualified TestScheduler as TestScheduler
 
 
 testSuite :: HUnit.Test
-testSuite = HUnit.TestList [TestSNMP.snmpTests, TestUDP.udpTests]
+testSuite = HUnit.TestList(
+    TestSNMP.tests :
+    -- TestUDP.tests :
+    -- TestScheduler.tests :
+    [])
 -- logging tests create files, so maybe don't run all the time
 -- testSuite = HUnit.TestList [TestLog.logTests]
 

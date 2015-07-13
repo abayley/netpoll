@@ -47,7 +47,8 @@ Rules). The rules are (summary, more detail below):
   - all values are encoded as type-length-value
   - type is a single byte
   - lengths < 128 are encoded as single byte
-  - lengths > 127 are encoded as 128 + bytes 
+  - lengths > 127 are encoded as 128 + n
+    (where n is the number of bytes required to encode the length)
     followed by the length value
   - strings encoded as-is (we use utf8 encoding)
   - signed integers are encoded as 2s-complement
@@ -56,8 +57,8 @@ Rules). The rules are (summary, more detail below):
   - oids are encoded as a byte for each number in the oid.
     If an element id > 127 then it is encoded as a sequence
     where the high bit of every byte is set, and the lower
-    7 bits hold the integer value.
-    The sequence is terminated by a byte with the high bit clear.
+    7 bits hold the integer value; the sequence is terminated
+    by a byte with the high bit clear.
 
 Common datatypes are:
 01 BOOLEAN
@@ -98,7 +99,8 @@ If it is not a trap, then the sequence of fields is:
   - error-index INTEGER
   - var bindings SEQUENCE
 
-And each varbind is:
+And each varbind is a pair of oid+value (so we use another
+sequence to enclose the pair):
   - SEQUENCE
     - OID
     - value
@@ -112,7 +114,7 @@ So for this snmpget example:
   snmpget -v 2c -c ab localhost sysObjectID.0
   (sysObjectID.0 is .1.3.6.1.2.1.1.2.0)
 
-the PDU (length 37 bytes) is like so:
+the request PDU (length 37 bytes) is like so:
 --------------------------------------
 0x30 type: SEQUENCE
 0x23 length 35
@@ -146,7 +148,7 @@ the PDU (length 37 bytes) is like so:
     0x0e length 14
     --------------------------------------
       0x30 type: SEQUENCE (varbind)
-      0x0c length 12    
+      0x0c length 12
       --------------------------------------
         0x06 type: OBJECT IDENTIFER (oid)
         0x08 length 8
@@ -157,7 +159,7 @@ the PDU (length 37 bytes) is like so:
         0x01
         0x01
         0x02
-        0x00 .1.3.6.1.2.1.1.2.0 
+        0x00 .1.3.6.1.2.1.1.2.0
         --------------------------------------
         0x05 type: NULL
         0x00 length 0
@@ -231,7 +233,7 @@ int2Words n =  -- n < 0
 -- into an Int.
 words2Int :: [Word.Word8] -> Int.Int64
 words2Int [] = 0
-words2Int s@(w1:_) = 
+words2Int s@(w1:_) =
     -- -positive
     if w1 < 128 then fromIntegral (words2Word s)
     -- negative
